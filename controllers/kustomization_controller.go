@@ -175,6 +175,27 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Examine if the object is under deletion
 	if !kustomization.ObjectMeta.DeletionTimestamp.IsZero() {
+		// hasForeground := false
+
+		finalizers := ""
+		for _, fin := range kustomization.Finalizers {
+			finalizers = fin + ", " + finalizers
+			if fin == "foregroundDeletion" {
+				// hasForeground = true
+			}
+		}
+
+		owners := ""
+		for _, ref := range kustomization.OwnerReferences {
+			owners = ref.Name + ", " + owners
+		}
+
+		// if hasForeground {
+		// 	log.Info("deleting... RETURN", "finalizers", finalizers, "owners", owners)
+		// 	return ctrl.Result{}, nil
+		// }
+
+		log.Info("deleting... FINALIZE", "finalizers", finalizers, "owners", owners)
 		return r.finalize(ctx, kustomization)
 	}
 
@@ -230,7 +251,7 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// check dependencies
 	if len(kustomization.Spec.DependsOn) > 0 {
-		if err := r.checkDependencies(source, kustomization); err != nil {
+		if err := r.checkDependencies(ctx, source, kustomization); err != nil {
 			kustomization = kustomizev1.KustomizationNotReady(
 				kustomization, source.GetArtifact().Revision, kustomizev1.DependencyNotReadyReason, err.Error())
 			if err := r.patchStatus(ctx, req, kustomization.Status); err != nil {
@@ -245,6 +266,7 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			r.recordReadiness(ctx, kustomization)
 			return ctrl.Result{RequeueAfter: r.requeueDependency}, nil
 		}
+
 		log.Info("All dependencies are ready, proceeding with reconciliation")
 	}
 
@@ -505,7 +527,10 @@ func (r *KustomizationReconciler) reconcile(
 	), nil
 }
 
-func (r *KustomizationReconciler) checkDependencies(source sourcev1.Source, kustomization kustomizev1.Kustomization) error {
+func (r *KustomizationReconciler) checkDependencies(ctx context.Context, source sourcev1.Source, kustomization kustomizev1.Kustomization) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	refs := []metav1.OwnerReference{}
 	for _, d := range kustomization.Spec.DependsOn {
 		if d.Namespace == "" {
 			d.Namespace = kustomization.GetNamespace()
@@ -531,6 +556,26 @@ func (r *KustomizationReconciler) checkDependencies(source sourcev1.Source, kust
 		if k.Spec.SourceRef.Name == kustomization.Spec.SourceRef.Name && k.Spec.SourceRef.Namespace == kustomization.Spec.SourceRef.Namespace && k.Spec.SourceRef.Kind == kustomization.Spec.SourceRef.Kind && source.GetArtifact().Revision != k.Status.LastAppliedRevision {
 			return fmt.Errorf("dependency '%s' is not updated yet", dName)
 		}
+
+		log.Info("adding owner reference", "name", k.Name, "namespace", k.Namespace)
+		pTrue := true
+		refs = append(refs, metav1.OwnerReference{
+			APIVersion:         k.APIVersion,
+			Kind:               k.Kind,
+			Name:               k.Name,
+			UID:                k.UID,
+			Controller:         &pTrue,
+			BlockOwnerDeletion: &pTrue,
+		})
+	}
+
+	patch := client.MergeFrom(kustomization.DeepCopy())
+	kustomization.OwnerReferences = refs
+
+	log.Info("patching owner references")
+	err := r.Client.Patch(context.Background(), &kustomization, patch, client.FieldOwner(r.statusManager))
+	if err != nil {
+		log.Error(err, "cannot patch owner references")
 	}
 
 	return nil
@@ -898,6 +943,10 @@ func (r *KustomizationReconciler) prune(ctx context.Context, manager *ssa.Resour
 		},
 	}
 
+	for _, obj := range objects {
+		log.Info("prune deleting:", "name", obj.GetName())
+	}
+
 	changeSet, err := manager.DeleteAll(ctx, objects, opts)
 	if err != nil {
 		return false, err
@@ -921,6 +970,16 @@ func (r *KustomizationReconciler) finalize(ctx context.Context, kustomization ku
 		kustomization.Status.Inventory.Entries != nil {
 		objects, _ := ListObjectsInInventory(kustomization.Status.Inventory)
 
+		// hasToDeleteObjects := false
+		// for _, obj := range objects {
+		// 	if !obj.GetDeletionTimestamp().IsZero() {
+		// 		hasToDeleteObjects = true
+		// 		break
+		// 	}
+		// }
+		// log.Info(fmt.Sprintf("has to delete objects: %v", hasToDeleteObjects))
+
+		// if hasToDeleteObjects {
 		impersonation := NewKustomizeImpersonation(kustomization, r.Client, r.StatusPoller, r.DefaultServiceAccount, r.KubeConfigOpts, r.PollingOpts)
 		if impersonation.CanFinalize(ctx) {
 			kubeClient, _, err := impersonation.GetClient(ctx)
@@ -934,7 +993,7 @@ func (r *KustomizationReconciler) finalize(ctx context.Context, kustomization ku
 			})
 
 			opts := ssa.DeleteOptions{
-				PropagationPolicy: metav1.DeletePropagationBackground,
+				PropagationPolicy: metav1.DeletePropagationForeground,
 				Inclusions:        resourceManager.GetOwnerLabels(kustomization.Name, kustomization.Namespace),
 				Exclusions: map[string]string{
 					fmt.Sprintf("%s/prune", kustomizev1.GroupVersion.Group):     kustomizev1.DisabledValue,
@@ -942,7 +1001,36 @@ func (r *KustomizationReconciler) finalize(ctx context.Context, kustomization ku
 				},
 			}
 
-			changeSet, err := resourceManager.DeleteAll(ctx, objects, opts)
+			kus := make([]*unstructured.Unstructured, 0)
+			rest := make([]*unstructured.Unstructured, 0)
+
+			for _, obj := range objects {
+				if obj.GetKind() == kustomization.Kind {
+					kus = append(kus, obj)
+				} else {
+					rest = append(rest, obj)
+				}
+			}
+
+			log.Info(fmt.Sprintf("deleting kus: %d", len(kus)))
+			changeSet, err := resourceManager.DeleteAll(ctx, kus, opts)
+			if err != nil {
+				r.event(ctx, kustomization, kustomization.Status.LastAppliedRevision, events.EventSeverityError, "pruning for deleted kustomizations failed", nil)
+				// Return the error so we retry the failed garbage collection
+				return ctrl.Result{}, err
+			}
+
+			err = resourceManager.WaitForTermination(kus, ssa.WaitOptions{Interval: 1 * time.Second, Timeout: 15 * time.Second})
+			if err != nil {
+				r.event(ctx, kustomization, kustomization.Status.LastAppliedRevision, events.EventSeverityError, "waiting for dependant kustomizations failed", nil)
+				// Return the error so we retry the failed garbage collection
+				return ctrl.Result{}, err
+			}
+
+			log.Info(fmt.Sprintf("deleting rest: %d", len(rest)))
+			opts.PropagationPolicy = metav1.DeletePropagationBackground
+			changeSet, err = resourceManager.DeleteAll(ctx, rest, opts)
+
 			if err != nil {
 				r.event(ctx, kustomization, kustomization.Status.LastAppliedRevision, events.EventSeverityError, "pruning for deleted resource failed", nil)
 				// Return the error so we retry the failed garbage collection
@@ -959,6 +1047,7 @@ func (r *KustomizationReconciler) finalize(ctx context.Context, kustomization ku
 			r.event(ctx, kustomization, kustomization.Status.LastAppliedRevision, events.EventSeverityError, msg, nil)
 		}
 	}
+	// }
 
 	// Record deleted status
 	r.recordReadiness(ctx, kustomization)
